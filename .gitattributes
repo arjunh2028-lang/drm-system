@@ -1,0 +1,7 @@
+# Prevent git from converting line endings (CRLF/LF) in the pre-loaded
+# sample content files. Their SHA-256 hashes are hard-coded in
+# database/sample_data.sql -- if git "helpfully" rewrote line endings
+# on checkout (e.g. Windows with autocrlf=true), the recomputed hash
+# would no longer match and the integrity check would incorrectly show
+# "MODIFIED" for files nobody actually touched.
+uploads/sample-* -text
