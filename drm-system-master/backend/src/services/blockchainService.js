@@ -26,8 +26,9 @@ function getRegistry({ write = false } = {}) {
   return { contract: new ethers.Contract(address, artifact.abi, runner), provider, ...getNetworkConfig() };
 }
 
-async function submitAndConfirm(txPromise) {
+async function submitAndConfirm(txPromise, onSubmitted = null) {
   const tx = await txPromise;
+  if (onSubmitted) await onSubmitted({ hash: tx.hash });
   const receipt = await tx.wait(Number(process.env.BLOCKCHAIN_CONFIRMATIONS || 1));
   if (!receipt || receipt.status !== 1) throw new Error('Blockchain transaction was not confirmed successfully.');
   return { hash: tx.hash, blockNumber: receipt.blockNumber };
@@ -52,20 +53,20 @@ async function registerAsset(contentId, fileHash, ownerWallet) {
   return submitAndConfirm(contract.registerAsset(contentId, hash, ownerWallet));
 }
 
-async function grantLicense(contentId, wallet, rightType, expiresAt = 0) {
+async function grantLicense(contentId, wallet, rightType, expiresAt = 0, onSubmitted = null) {
   const rightId = RIGHT_IDS[rightType];
   if (!rightId) throw new ApiError(400, 'Unsupported license right type.');
   const { contract } = getRegistry({ write: true });
-  return submitAndConfirm(contract.grantLicense(contentId, wallet, rightId, expiresAt));
+  return submitAndConfirm(contract.grantLicense(contentId, wallet, rightId, expiresAt), onSubmitted);
 }
 
-async function revokeLicense(contentId, wallet, rightType) {
+async function revokeLicense(contentId, wallet, rightType, onSubmitted = null) {
   const rightId = RIGHT_IDS[rightType];
   if (!rightId) throw new ApiError(400, 'Unsupported license right type.');
   const { contract } = getRegistry({ write: true });
   const license = await contract.licenses(contentId, wallet, rightId);
   if (license.issuedAt === 0n || license.revoked) return { hash: null, alreadyInactive: true };
-  return submitAndConfirm(contract.revokeLicense(contentId, wallet, rightId));
+  return submitAndConfirm(contract.revokeLicense(contentId, wallet, rightId), onSubmitted);
 }
 
 async function verifyAccess(contentId, fileHash, ownerWallet, userWallet, rightType, isOwner) {

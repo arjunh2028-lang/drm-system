@@ -3,9 +3,11 @@ const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
 const { getContentById } = require('../services/rightsService');
 const { getNetworkConfig, registerAsset, grantLicense } = require('../services/blockchainService');
+const { validContentId } = require('../services/contentProtectionService');
+const { logSecurityEvent } = require('../services/securityAuditService');
 
 const getAssetStatus = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
+  const contentId = validContentId(req.params.id);
   const content = await getContentById(contentId);
   if (!content) throw new ApiError(404, 'Content not found.');
   if (content.owner_id !== req.user.userId) throw new ApiError(403, 'Only the content owner can inspect blockchain registration details.');
@@ -14,7 +16,7 @@ const getAssetStatus = asyncHandler(async (req, res) => {
 });
 
 const registerAssetOnChain = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
+  const contentId = validContentId(req.params.id);
   const content = await getContentById(contentId);
   if (!content) throw new ApiError(404, 'Content not found.');
   if (content.owner_id !== req.user.userId) throw new ApiError(403, 'Only the content owner can register this asset.');
@@ -84,15 +86,16 @@ const registerAssetOnChain = asyncHandler(async (req, res) => {
     for (const right of activeRights) {
       const expiresAt = 0;
       const [operation] = await pool.query(
-        `INSERT INTO blockchain_operations (content_id, right_id, operation_type, wallet_address, right_type, status)
-         VALUES (?, ?, 'GRANT', ?, ?, 'PENDING')`,
-        [contentId, right.right_id, right.wallet_address, right.right_type]
+        `INSERT INTO blockchain_operations (content_id, right_id, actor_user_id, operation_type, wallet_address, right_type, status)
+         VALUES (?, ?, ?, 'GRANT', ?, ?, 'PENDING')`,
+        [contentId, right.right_id, req.user.userId, right.wallet_address, right.right_type]
       );
       let result;
       try {
-        result = await grantLicense(contentId, right.wallet_address, right.right_type, expiresAt);
+        result = await grantLicense(contentId, right.wallet_address, right.right_type, expiresAt,
+          async ({ hash }) => pool.query('UPDATE blockchain_operations SET transaction_hash = ? WHERE operation_id = ?', [hash, operation.insertId]));
       } catch (err) {
-        await pool.query(`UPDATE blockchain_operations SET status = 'FAILED', database_sync_status = 'FAILED', error_message = ? WHERE operation_id = ?`, [String(err.message || 'License migration failed').slice(0, 490), operation.insertId]);
+        await pool.query(`UPDATE blockchain_operations SET status = IF(transaction_hash IS NULL, 'FAILED', 'PENDING'), database_sync_status = IF(transaction_hash IS NULL, 'FAILED', 'PENDING'), error_message = ? WHERE operation_id = ?`, [String(err.message || 'License migration failed').slice(0, 490), operation.insertId]);
         throw err;
       }
       await pool.query(
@@ -112,6 +115,7 @@ const registerAssetOnChain = asyncHandler(async (req, res) => {
   } catch (err) {
     const reported = err instanceof ApiError ? err : new ApiError(502, `Blockchain registration failed: ${String(err.message || 'transaction failed').slice(0, 250)}`);
     await pool.query('UPDATE blockchain_assets SET status = \'FAILED\', error_message = ? WHERE content_id = ?', [reported.message.slice(0, 490), contentId]);
+    await logSecurityEvent({ req, eventType: 'ASSET_REGISTRATION_FAILED', contentId, outcome: 'ERROR', detail: 'Blockchain asset registration or rights migration failed' });
     throw reported;
   }
 });

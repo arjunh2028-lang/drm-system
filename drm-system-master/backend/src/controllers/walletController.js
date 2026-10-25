@@ -3,6 +3,7 @@ const { ethers } = require('ethers');
 const { pool } = require('../config/db');
 const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
+const { logSecurityEvent } = require('../services/securityAuditService');
 
 const walletStatus = asyncHandler(async (req, res) => {
   const [rows] = await pool.query('SELECT wallet_address FROM users WHERE user_id = ?', [req.user.userId]);
@@ -35,11 +36,20 @@ const verifyChallenge = asyncHandler(async (req, res) => {
      ORDER BY challenge_id DESC LIMIT 1`,
     [req.user.userId, walletAddress, message]
   );
-  if (!rows.length) throw new ApiError(400, 'Wallet challenge is missing, expired, or already used.');
+  if (!rows.length) {
+    await logSecurityEvent({ req, eventType: 'WALLET_CHALLENGE_FAILED', detail: 'Challenge missing, expired, or consumed' });
+    throw new ApiError(400, 'Wallet challenge is missing, expired, or already used.');
+  }
 
   let recovered;
-  try { recovered = ethers.verifyMessage(rows[0].message, signature); } catch (_) { throw new ApiError(400, 'Wallet signature is invalid.'); }
-  if (recovered.toLowerCase() !== walletAddress.toLowerCase()) throw new ApiError(400, 'Signature does not prove ownership of the requested wallet.');
+  try { recovered = ethers.verifyMessage(rows[0].message, signature); } catch (_) {
+    await logSecurityEvent({ req, eventType: 'WALLET_SIGNATURE_FAILED', detail: 'Signature could not be verified' });
+    throw new ApiError(400, 'Wallet signature is invalid.');
+  }
+  if (recovered.toLowerCase() !== walletAddress.toLowerCase()) {
+    await logSecurityEvent({ req, eventType: 'WALLET_SIGNATURE_FAILED', detail: 'Recovered signer did not match challenge wallet' });
+    throw new ApiError(400, 'Signature does not prove ownership of the requested wallet.');
+  }
 
   const [consume] = await pool.query(
     'UPDATE wallet_link_challenges SET consumed_at = CURRENT_TIMESTAMP WHERE challenge_id = ? AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP',

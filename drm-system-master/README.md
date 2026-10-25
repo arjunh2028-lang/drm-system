@@ -1,10 +1,9 @@
-# DRM System — V1 Blockchain Asset and License Management
+# DRM System — V2 Core DRM Protection and Security Hardening
 
-An existing React, Express and MySQL DRM application extended with an optional
-EVM-compatible asset and license registry. Blockchain-enabled assets require
-confirmed on-chain ownership/license state as well as the existing MySQL checks;
-legacy assets retain the existing database-only behavior. Content remains
-plaintext in V1, so blockchain records do not prevent copying.
+React, Express and MySQL DRM application with an EVM-compatible asset/license
+registry and V2 AES-256-GCM envelope encryption. New uploads are encrypted before
+they reach storage. Converted legacy files use the same protected delivery path;
+unconverted legacy files are identified and protected delivery is refused.
 
 ---
 
@@ -34,7 +33,8 @@ React (Vite) -> Express API -> MySQL + local file storage
 - **Frontend**: React + Vite, plain CSS, `axios` for API calls, JWT stored in `localStorage`.
 - **Backend**: Node.js + Express, `mysql2` connection pool, `multer` for file uploads, `bcryptjs` + `jsonwebtoken` for auth.
 - **Database**: MySQL — normalized account/content/rights/activity tables plus blockchain and wallet-link tables, 2 views, 2 triggers, and 2 stored procedures (see `database/schema.sql`).
-- **File storage**: local filesystem under `uploads/`. Files remain plaintext; blockchain registration does not encrypt or prevent copying them.
+- **File storage**: private local filesystem under `uploads/`. New content is AES-256-GCM ciphertext. The original SHA-256 remains the hash registered on chain; a separate encrypted-file hash validates stored ciphertext.
+- **Key management**: each asset has a random DEK; the backend wraps it with a separate 32-byte KEK from `CONTENT_KEK_BASE64`. This environment-variable KEK is development-grade, not a managed KMS or hardware-backed key store.
 - **Blockchain**: Solidity `DRMRegistry`, local Hardhat network, verified wallet association, asset hash/owner records, and wallet/right-scoped licenses. A backend-held issuer submits transactions after checking application permissions; this is a centralized trust model.
 
 ## 3. Requirements
@@ -81,13 +81,17 @@ Note: if you use Option B, make sure your git checkout hasn't altered
 line endings on the `uploads/sample-*` files (a committed
 `.gitattributes` already prevents this).
 
+Demo SQL/seed content begins as legacy plaintext. After completing backend
+configuration, follow “V2 Operations” below to preview and convert it before
+expecting protected view/download to work.
+
 ### 4.2 Backend Setup
 
 ```bash
 cd backend
 npm install
 cp .env.example .env
-# edit .env: set DB_PASSWORD (and DB_USER if not root), and JWT_SECRET
+# edit .env: set DB_PASSWORD (and DB_USER if not root), JWT_SECRET, and a freshly generated CONTENT_KEK_BASE64
 npm start
 ```
 
@@ -156,8 +160,8 @@ GET    /api/content              content you own
 GET    /api/content/accessible   content shared with you (not owned)
 POST   /api/content              multipart upload: fields "file", "title"
 GET    /api/content/:id          full details + rights + your permissions
-GET    /api/content/:id/view     stream file inline (requires VIEW or ownership)
-GET    /api/content/:id/download stream file as attachment (requires DOWNLOAD or ownership)
+GET    /api/content/:id/view     decrypt after VIEW authorization (does not grant DOWNLOAD)
+GET    /api/content/:id/download decrypt after DOWNLOAD authorization
 GET    /api/content/:id/verify   recompute SHA-256, compare to stored hash
 ```
 
@@ -189,21 +193,26 @@ Also included:
 - **Stored procedures**: `sp_grant_right` (idempotent grant/re-grant), `sp_revoke_right`
 - `database/queries.sql` has annotated example JOINs, GROUP BY/HAVING, subqueries, and transactions
 
-## 9. Security Notes (V1 scope)
+## 9. Security Notes
 
 - Passwords hashed with bcrypt (`bcryptjs`), never stored or logged in plaintext.
 - JWT-based auth with an expiring token; all content/rights/history routes require it.
-- Every access check (VIEW/DOWNLOAD/SHARE) happens in the Express backend against the database — the frontend UI hides buttons for convenience only, it is never the actual gate.
+- Content delivery checks the authenticated server-side VIEW or DOWNLOAD right, expiration and revocation state, and confirmed chain state where an asset is registered. VIEW does not imply DOWNLOAD or SHARE.
 - Uploaded filenames are sanitized and given a random unique stored name, preventing path traversal or collisions.
 - File type is restricted to an allowlist of common document/media extensions, and file size is capped (`MAX_FILE_SIZE_MB`).
-- Secrets (`JWT_SECRET`, DB credentials) live only in `.env`, which is git-ignored.
+- Secrets (`JWT_SECRET`, DB credentials, blockchain issuer key, and `CONTENT_KEK_BASE64`) live only in `.env`, which is git-ignored.
 - Errors are logged server-side but only generic messages are returned to the client — no stack traces leak.
 
-## 10. Known Limitations of V1
+## 10. Known Limitations
 
 - No password reset / email verification flow.
 - No pagination on content or history lists (fine for a class demo dataset, would need it at scale).
 - No virus/malware scanning of uploaded files — extension allowlist only.
+- Authorized view/download returns plaintext to the user's browser. Watermarks and server-side authorization discourage misuse but cannot prevent screenshots, copying, or redistribution.
+- Visible watermarking is implemented for UTF-8 `.txt` and `.csv`; other formats are delivered without a watermark and explicitly report `X-DRM-Watermark: unsupported-format`.
+- The KEK is stored in an environment variable. Production requires managed KMS/HSM custody, rotation, backup, access controls, and incident recovery.
+- Legacy files stay plaintext until conversion. The conversion command preserves the original plaintext backup; operators must store it in protected backup storage or explicitly remove it after verification and retention approval.
+- If the KEK is lost, wrapped DEKs cannot be recovered. Keep a controlled backup separate from the application host.
 - No content versioning (re-uploading creates a new content record rather than a new version of an existing one).
 - Moderator accounts are provisioned by an administrator; public registration cannot create moderators.
 - Rights are per-file; no folder/collection-level permission model yet.
@@ -259,11 +268,15 @@ repository root unless stated otherwise.
    blockchain settings. Compile contracts before starting the API; it reads the
    ABI from `blockchain/artifacts`.
 
-5. For an existing V1 database, back it up and apply the additive migration once:
+5. For an existing V1 database, back it up and apply the additive V1 blockchain migration, then V2 migration:
 
    ```sh
    mysql -u root -p drm_system < database/migrations/001_blockchain.sql
    ```
+
+   After backend dependencies and `.env` are configured, run `npm run migrate:v2`
+   from `backend/`. This introspects the schema and can be safely rerun. Existing
+   content is marked `LEGACY`; convert it only after taking a storage backup.
 
    This adds wallet/challenge and blockchain status tables; it does not register
    old content or revoke old rights. A fresh database can use the updated
@@ -305,24 +318,106 @@ Legacy content remains on the original DB-only path until registered.
 - **Package install fails certificate verification:** use a working trusted
   registry/certificate configuration; do not disable TLS certificate checks.
 
-### V1 trust and security limits
+### Trust and security limits
 
 - The backend issuer is centralized and submits transactions after application
   authorization. Wallet signatures prove account ownership but do not make this a
   decentralized owner-signed transaction model.
-- Files remain plaintext at rest and are delivered as plaintext to authorized
-  viewers/downloads. Blockchain registration is not encryption and cannot erase
-  copies already obtained.
-- Production key custody, HTTPS deployment, secure playback, and recovery from
-  inconsistent database/chain writes need further operational work.
+- Content is encrypted at rest after upload/conversion, but authorized users
+  receive plaintext in their browser. Blockchain registration is not DRM by
+  itself and cannot erase copies already obtained.
+- Production key custody, HTTPS deployment, secure playback, and live recovery
+  from inconsistent database/chain writes need operational validation.
 - Public moderator registration is rejected and moderator-only content endpoints
   require the moderator role.
 
 See [`docs/DRM_FEATURE_TRACKER.md`](docs/DRM_FEATURE_TRACKER.md) for all original
 A1–G9 requirements and their current evidence status.
 
-## 12. V2 Roadmap (Advanced DRM)
+## 12. V3 Roadmap (Advanced DRM)
 
-Future work may add full content encryption/key management, hardened protected
-viewing, device controls, watermarking, advanced abuse detection and production
-key custody. These features are intentionally not claimed by V1.
+Future work may add managed production key custody, hardened protected viewing,
+device controls, forensic per-copy watermarking, advanced abuse detection and
+offline enforcement. These features are not claimed by V2.
+
+## 13. V2 Operations
+
+### Required key setup
+
+Configure `CONTENT_KEK_BASE64` in `backend/.env` before starting the API. Generate
+32 random bytes with Node's built-in cryptography (run locally, never paste the
+result into source control):
+
+```sh
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+The backend validates the value at startup and refuses to start if it is missing
+or malformed. Back up the KEK in a restricted secret manager. Losing the KEK
+permanently prevents decryption of its wrapped asset keys.
+
+### Migrations and legacy files
+
+Back up MySQL and `uploads/` first. For an existing V1 database, apply the V2
+additive migration after `001_blockchain.sql`:
+
+```sh
+cd backend
+npm run migrate:v2
+```
+
+The migration is safe to rerun; existing rows are classified `LEGACY`. Preview
+the files that can be converted, then opt in to conversion:
+
+```sh
+npm run convert:legacy-content
+npm run convert:legacy-content -- --apply
+```
+
+The converter checks each original plaintext SHA-256, writes a separate
+ciphertext file, decrypts it in memory to verify the round trip, and only then
+updates that row's storage path and encryption metadata. It retains the
+plaintext source as a recoverable backup and reports failures/skips. Store that
+backup offline with appropriate access controls; the application no longer
+delivers the old path after the row is marked encrypted. Verify the converted
+assets through the application before retiring backups under your retention
+policy. A crash before the DB update may leave an unused ciphertext sibling;
+rerun conversion safely and inspect storage before cleanup.
+
+For a fresh installation, use the updated `database/schema.sql`; it creates
+encryption metadata and security audit tables. Do not run the destructive fresh
+schema against an existing database.
+
+### License recovery and verification
+
+Run the reconciliation command after resolving RPC/database outages:
+
+```sh
+cd backend
+npm run reconcile:blockchain
+```
+
+It inspects confirmed or submitted transactions, waits for the configured
+confirmation depth, checks current on-chain license state, then synchronizes
+MySQL rights and operation records transactionally. Pending or conflicting
+chain state is reported as skipped for manual review rather than granted.
+
+Run backend tests with `npm test` from `backend/`, contract tests with `npm test`
+from `blockchain/`, and the frontend build with `npm run build` from `frontend/`.
+Use a separate disposable database and local chain for integration checks.
+
+### Delivery and monitoring behavior
+
+Uploads use in-memory multipart handling and persist only ciphertext. Protected
+content routes authorize before setting response headers, verify encrypted hash,
+AES-GCM authentication, and the original plaintext SHA-256 before sending bytes.
+Responses are private/no-store and use nosniff/sandbox headers. Only `.txt` and
+`.csv` get a server-generated visible identity/asset/time watermark. Security
+events record authentication/access denials and blockchain failures without
+recording credentials, signatures, keys, or file contents. A configurable count
+of repeated denials emits a warning; it is not a claim that an account is
+malicious.
+
+Legacy DB-only rights are retained as a migration path, but legacy plaintext
+files cannot be viewed or downloaded through protected delivery until
+conversion. Blockchain-backed assets in PENDING or FAILED state fail closed.

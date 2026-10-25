@@ -9,6 +9,7 @@ const historyRoutes = require('./routes/historyRoutes');
 const myRightsRoutes = require('./routes/myRightsRoutes');
 const walletRoutes = require('./routes/walletRoutes');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
+const { validateConfiguration: validateEncryptionConfiguration } = require('./services/encryptionService');
 
 const app = express();
 
@@ -28,6 +29,7 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 
+validateEncryptionConfiguration();
 verifyConnection().then(() => {
   app.listen(PORT, () => {
     console.log(`[server] DRM backend running on http://localhost:${PORT}`);

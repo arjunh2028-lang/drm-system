@@ -13,13 +13,58 @@ const {
 const { UPLOAD_DIR, PROJECT_ROOT } = require('../config/paths');
 const { verifyAccess } = require('../services/blockchainService');
 const { grantLicense } = require('../services/blockchainService');
+const { encryptBuffer } = require('../services/encryptionService');
+const { authorizeContentAccess, readAuthorizedContent, validContentId, watermarkText } = require('../services/contentProtectionService');
+const { logSecurityEvent } = require('../services/securityAuditService');
+
+function contentIdFromRequest(value) { return validContentId(value); }
+
+function responseMimeType(filename) {
+  const byExtension = {
+    '.pdf': 'application/pdf', '.txt': 'text/plain; charset=utf-8', '.csv': 'text/csv; charset=utf-8',
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+    '.mp3': 'audio/mpeg', '.mp4': 'video/mp4',
+  };
+  return byExtension[path.extname(filename || '').toLowerCase()] || 'application/octet-stream';
+}
+
+async function protectedDelivery(req, res, mode) {
+  const contentId = contentIdFromRequest(req.params.id);
+  const content = await getContentById(contentId);
+  if (!content) throw new ApiError(404, 'Content not found.');
+  const rightType = mode === 'download' ? 'DOWNLOAD' : 'VIEW';
+  try {
+    await authorizeContentAccess({ content, req, rightType });
+    const plaintext = await readAuthorizedContent(content);
+    const [userRows] = await pool.query('SELECT name FROM users WHERE user_id = ?', [req.user.userId]);
+    if (!userRows.length) throw new ApiError(401, 'Authenticated account no longer exists.');
+    const watermarked = watermarkText(plaintext, content, { ...req.user, name: userRows[0].name });
+    await logActivity({ contentId, actorId: req.user.userId, action: mode === 'download' ? 'CONTENT_DOWNLOADED' : 'CONTENT_VIEWED', details: mode === 'download' ? 'Downloaded protected content' : 'Viewed protected content' });
+    const safeName = path.basename(content.original_filename).replace(/[\r\n"\\]/g, '_');
+    res.set({
+      'Content-Type': responseMimeType(content.original_filename),
+      'Content-Disposition': `${mode === 'download' ? 'attachment' : 'inline'}; filename="${safeName}"`,
+      'Cache-Control': 'private, no-store, no-cache, must-revalidate',
+      Pragma: 'no-cache',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "sandbox; default-src 'none'",
+      'Referrer-Policy': 'no-referrer',
+      'X-DRM-Encryption': 'AES-256-GCM',
+      'X-DRM-Watermark': watermarked.applied ? 'applied' : 'unsupported-format',
+    });
+    return res.status(200).send(watermarked.data);
+  } catch (err) {
+    await logSecurityEvent({ req, eventType: `${rightType}_${err.statusCode === 403 ? 'DENIED' : 'DELIVERY_ERROR'}`, contentId, outcome: err.statusCode === 403 ? 'DENIED' : 'ERROR', detail: err.statusCode === 403 ? 'Authorization denied' : 'Protected content could not be verified' });
+    throw err;
+  }
+}
 
 async function requireBlockchainDecision(content, req, rightType, isOwner) {
   const [assets] = await pool.query('SELECT status, owner_wallet FROM blockchain_assets WHERE content_id = ?', [content.content_id]);
   if (!assets.length) return; // Explicit legacy path, preserving V1 behavior.
   // Preserve the established MySQL behavior until asset registration and its
   // active-license migration are fully confirmed. Once confirmed, fail closed.
-  if (assets[0].status !== 'CONFIRMED') return;
+  if (assets[0].status !== 'CONFIRMED') throw new ApiError(503, 'Blockchain asset is not confirmed; access cannot be verified.');
   const [wallets] = await pool.query(
     'SELECT user_id, wallet_address FROM users WHERE user_id IN (?, ?)',
     [req.user.userId, content.owner_id]
@@ -36,7 +81,7 @@ async function requireBlockchainDecision(content, req, rightType, isOwner) {
 // GET /api/content  -> content owned by the current user ("My Content")
 const listOwnedContent = asyncHandler(async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT content_id, title, original_filename, file_size, file_hash, upload_timestamp
+    `SELECT content_id, title, original_filename, file_size, file_hash, encryption_status, upload_timestamp
      FROM content WHERE owner_id = ? ORDER BY upload_timestamp DESC`,
     [req.user.userId]
   );
@@ -48,14 +93,17 @@ const listOwnedContent = asyncHandler(async (req, res) => {
 const listAccessibleContent = asyncHandler(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT DISTINCT
-        c.content_id, c.title, c.original_filename, c.file_size, c.upload_timestamp,
+        c.content_id, c.title, c.original_filename, c.file_size, c.encryption_status, c.upload_timestamp,
         u.name AS owner_name,
         GROUP_CONCAT(DISTINCT r.right_type ORDER BY r.right_type SEPARATOR ',') AS my_rights
      FROM content c
      JOIN rights r ON r.content_id = c.content_id AND r.user_id = ? AND r.status = 'ACTIVE'
+       AND (NOT EXISTS (SELECT 1 FROM blockchain_assets ba WHERE ba.content_id = c.content_id AND ba.status = 'CONFIRMED')
+         OR EXISTS (SELECT 1 FROM blockchain_rights br WHERE br.right_id = r.right_id AND br.status = 'CONFIRMED'
+           AND (br.expiration_timestamp IS NULL OR br.expiration_timestamp = 0 OR br.expiration_timestamp > UNIX_TIMESTAMP())))
      JOIN users u  ON u.user_id = c.owner_id
      WHERE c.owner_id != ?
-     GROUP BY c.content_id, c.title, c.original_filename, c.file_size, c.upload_timestamp, u.name
+     GROUP BY c.content_id, c.title, c.original_filename, c.file_size, c.encryption_status, c.upload_timestamp, u.name
      ORDER BY c.upload_timestamp DESC`,
     [req.user.userId, req.user.userId]
   );
@@ -68,51 +116,51 @@ const uploadContent = asyncHandler(async (req, res) => {
   if (!req.file) {
     throw new ApiError(400, 'A file is required.');
   }
-  const title = (req.body.title || req.file.originalname).trim();
+  const rawTitle = req.body.title || req.file.originalname;
+  if (typeof rawTitle !== 'string') throw new ApiError(400, 'Title must be text.');
+  const title = rawTitle.trim();
   if (!title) {
-    // Clean up the orphaned upload before failing.
-    fs.unlink(req.file.path, () => {});
     throw new ApiError(400, 'Title is required.');
   }
 
-  const fileHash = await sha256File(req.file.path);
-
-  const [result] = await pool.query(
-    `INSERT INTO content (title, original_filename, stored_filename, file_path, file_hash, file_size, owner_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [
-      title,
-      req.file.originalname,
-      req.file.filename,
-      path.relative(PROJECT_ROOT, req.file.path),
-      fileHash,
-      req.file.size,
-      req.user.userId,
-    ]
-  );
-
-  await logActivity({
-    contentId: result.insertId,
-    actorId: req.user.userId,
-    action: 'CONTENT_UPLOADED',
-    details: `Uploaded ${req.file.originalname}`,
-  });
-
-  res.status(201).json({
-    message: 'Content uploaded successfully.',
-    content: {
-      id: result.insertId,
-      title,
-      originalFilename: req.file.originalname,
-      fileSize: req.file.size,
-      fileHash,
-    },
-  });
+  const fileHash = require('crypto').createHash('sha256').update(req.file.buffer).digest('hex');
+  const fileId = require('crypto').randomBytes(16).toString('hex');
+  const storedFilename = `${fileId}.drm`;
+  const absolutePath = path.join(UPLOAD_DIR, storedFilename);
+  const encrypted = encryptBuffer(req.file.buffer);
+  try {
+    await fs.promises.mkdir(UPLOAD_DIR, { recursive: true });
+    await fs.promises.writeFile(absolutePath, encrypted.ciphertext, { flag: 'wx', mode: 0o600 });
+  } catch (err) {
+    await fs.promises.unlink(absolutePath).catch(() => {});
+    throw err;
+  }
+  let inserted = false;
+  try {
+    const [result] = await pool.query(
+      `INSERT INTO content (title, original_filename, stored_filename, file_path, file_hash, file_size, owner_id,
+        encryption_status, encrypted_dek, kek_nonce, kek_auth_tag, content_nonce, content_auth_tag, encrypted_file_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'ENCRYPTED', ?, ?, ?, ?, ?, ?)`,
+      [title, req.file.originalname, storedFilename, path.relative(PROJECT_ROOT, absolutePath), fileHash,
+        req.file.size, req.user.userId, encrypted.metadata.encryptedDek, encrypted.metadata.wrapIv,
+        encrypted.metadata.wrapTag, encrypted.metadata.contentIv, encrypted.metadata.contentTag, encrypted.metadata.encryptedHash]
+    );
+    inserted = true;
+    await logActivity({ contentId: result.insertId, actorId: req.user.userId, action: 'CONTENT_UPLOADED', details: `Encrypted upload ${path.basename(req.file.originalname).slice(0, 160)}` })
+      .catch((err) => console.error('[activity] upload event could not be recorded:', err.message));
+    res.status(201).json({
+      message: 'Content uploaded and encrypted successfully.',
+      content: { id: result.insertId, title, originalFilename: req.file.originalname, fileSize: req.file.size, fileHash, encryptionStatus: 'ENCRYPTED' },
+    });
+  } catch (err) {
+    if (!inserted) await fs.promises.unlink(absolutePath).catch(() => {});
+    throw err;
+  }
 });
 
 // GET /api/content/:id -> full details, current rights, my rights
 const getContentDetails = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
+  const contentId = contentIdFromRequest(req.params.id);
   const content = await getContentById(contentId);
   if (!content) throw new ApiError(404, 'Content not found.');
 
@@ -147,6 +195,7 @@ const getContentDetails = asyncHandler(async (req, res) => {
     originalFilename: content.original_filename,
     fileSize: content.file_size,
     fileHash: content.file_hash,
+    encryptionStatus: content.encryption_status || 'LEGACY',
     uploadTimestamp: content.upload_timestamp,
     owner: { id: content.owner_id, name: content.owner_name, email: content.owner_email },
     isOwner,
@@ -159,53 +208,17 @@ const getContentDetails = asyncHandler(async (req, res) => {
 
 // GET /api/content/:id/view -> requires VIEW (owner always passes)
 const viewContent = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
-  const content = await getContentById(contentId);
-  if (!content) throw new ApiError(404, 'Content not found.');
-
-  const isOwner = content.owner_id === req.user.userId;
-  const allowed = isOwner || (await hasActiveRight(req.user.userId, contentId, 'VIEW'));
-  if (!allowed) throw new ApiError(403, 'You do not have VIEW permission for this content.');
-  await requireBlockchainDecision(content, req, 'VIEW', isOwner);
-
-  const absolutePath = path.resolve(PROJECT_ROOT, content.file_path);
-  if (!absolutePath.startsWith(path.resolve(UPLOAD_DIR)) && !absolutePath.includes(`${path.sep}uploads${path.sep}`)) {
-    throw new ApiError(500, 'Stored file path is invalid.');
-  }
-  if (!fs.existsSync(absolutePath)) {
-    throw new ApiError(404, 'The underlying file is missing from storage.');
-  }
-
-  await logActivity({ contentId, actorId: req.user.userId, action: 'CONTENT_VIEWED', details: 'Viewed content' });
-
-  res.setHeader('Content-Disposition', `inline; filename="${content.original_filename}"`);
-  res.sendFile(absolutePath);
+  return protectedDelivery(req, res, 'view');
 });
 
 // GET /api/content/:id/download -> requires DOWNLOAD (owner always passes)
 const downloadContent = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
-  const content = await getContentById(contentId);
-  if (!content) throw new ApiError(404, 'Content not found.');
-
-  const isOwner = content.owner_id === req.user.userId;
-  const allowed = isOwner || (await hasActiveRight(req.user.userId, contentId, 'DOWNLOAD'));
-  if (!allowed) throw new ApiError(403, 'You do not have DOWNLOAD permission for this content.');
-  await requireBlockchainDecision(content, req, 'DOWNLOAD', isOwner);
-
-  const absolutePath = path.resolve(PROJECT_ROOT, content.file_path);
-  if (!fs.existsSync(absolutePath)) {
-    throw new ApiError(404, 'The underlying file is missing from storage.');
-  }
-
-  await logActivity({ contentId, actorId: req.user.userId, action: 'CONTENT_DOWNLOADED', details: 'Downloaded content' });
-
-  res.download(absolutePath, content.original_filename);
+  return protectedDelivery(req, res, 'download');
 });
 
 // GET /api/content/:id/verify -> recompute SHA-256 and compare
 const verifyIntegrity = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
+  const contentId = contentIdFromRequest(req.params.id);
   const content = await getContentById(contentId);
   if (!content) throw new ApiError(404, 'Content not found.');
 
@@ -216,13 +229,23 @@ const verifyIntegrity = asyncHandler(async (req, res) => {
     (await hasActiveRight(req.user.userId, contentId, 'DOWNLOAD'));
   if (!canAccess) throw new ApiError(403, 'You do not have access to this content.');
 
-  const absolutePath = path.resolve(PROJECT_ROOT, content.file_path);
-  if (!fs.existsSync(absolutePath)) {
-    return res.json({ status: 'MISSING', storedHash: content.file_hash, currentHash: null });
+  try { await authorizeContentAccess({ content, req, rightType: isOwner ? 'VIEW' : (await hasActiveRight(req.user.userId, contentId, 'VIEW') ? 'VIEW' : 'DOWNLOAD') }); }
+  catch (err) { await logSecurityEvent({ req, eventType: 'INTEGRITY_CHECK_DENIED', contentId, detail: 'Authorization or chain verification denied' }); throw err; }
+  let currentHash;
+  try {
+    if (content.encryption_status === 'ENCRYPTED') {
+      const plaintext = await readAuthorizedContent(content);
+      currentHash = require('crypto').createHash('sha256').update(plaintext).digest('hex');
+    } else {
+      currentHash = await sha256File(require('../services/contentProtectionService').resolveStoredPath(content.file_path));
+    }
+  } catch (err) {
+    if (err.statusCode === 404) return res.json({ status: 'MISSING', storedHash: content.file_hash, currentHash: null });
+    await logSecurityEvent({ req, eventType: 'INTEGRITY_VERIFICATION_FAILED', contentId, outcome: 'ERROR', detail: 'Stored content failed integrity or decryption verification' });
+    throw err;
   }
-
-  const currentHash = await sha256File(absolutePath);
   const status = currentHash === content.file_hash ? 'VERIFIED' : 'MODIFIED';
+  await logSecurityEvent({ req, eventType: 'INTEGRITY_CHECK', contentId, outcome: status === 'VERIFIED' ? 'ALLOWED' : 'DENIED', detail: status });
 
   res.json({ status, storedHash: content.file_hash, currentHash });
 });
@@ -231,13 +254,16 @@ const verifyIntegrity = asyncHandler(async (req, res) => {
 const listCatalogContent = asyncHandler(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT 
-        c.content_id, c.title, c.original_filename, c.file_size, c.upload_timestamp, c.file_hash,
+        c.content_id, c.title, c.original_filename, c.file_size, c.upload_timestamp, c.file_hash, c.encryption_status,
         u.name AS owner_name, u.user_id AS owner_id,
         GROUP_CONCAT(DISTINCT r.right_type) AS user_rights
      FROM content c
      JOIN users u ON u.user_id = c.owner_id
      LEFT JOIN rights r ON r.content_id = c.content_id AND r.user_id = ? AND r.status = 'ACTIVE'
-     GROUP BY c.content_id, c.title, c.original_filename, c.file_size, c.upload_timestamp, c.file_hash, u.name, u.user_id
+       AND (NOT EXISTS (SELECT 1 FROM blockchain_assets ba WHERE ba.content_id = c.content_id AND ba.status = 'CONFIRMED')
+         OR EXISTS (SELECT 1 FROM blockchain_rights br WHERE br.right_id = r.right_id AND br.status = 'CONFIRMED'
+           AND (br.expiration_timestamp IS NULL OR br.expiration_timestamp = 0 OR br.expiration_timestamp > UNIX_TIMESTAMP())))
+     GROUP BY c.content_id, c.title, c.original_filename, c.file_size, c.upload_timestamp, c.file_hash, c.encryption_status, u.name, u.user_id
      ORDER BY c.upload_timestamp DESC`,
     [req.user.userId]
   );
@@ -251,7 +277,7 @@ const listCatalogContent = asyncHandler(async (req, res) => {
 
 // POST /api/content/:id/purchase -> user acquires rights (VIEW or DOWNLOAD)
 const purchaseRight = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
+  const contentId = contentIdFromRequest(req.params.id);
   const { rightType = 'VIEW' } = req.body;
   const content = await getContentById(contentId);
   if (!content) throw new ApiError(404, 'Content not found.');
@@ -261,19 +287,23 @@ const purchaseRight = asyncHandler(async (req, res) => {
   }
 
   const validTypes = ['VIEW', 'DOWNLOAD'];
-  const typeToGrant = validTypes.includes(rightType.toUpperCase()) ? rightType.toUpperCase() : 'VIEW';
+  if (typeof rightType !== 'string' || !validTypes.includes(rightType.toUpperCase())) throw new ApiError(400, 'rightType must be VIEW or DOWNLOAD.');
+  const typeToGrant = rightType.toUpperCase();
 
   // Check if right already exists
   const [existing] = await pool.query(
-    'SELECT right_id, status FROM rights WHERE content_id = ? AND user_id = ? AND right_type = ?',
+    `SELECT r.right_id, r.status, br.expiration_timestamp FROM rights r
+     LEFT JOIN blockchain_rights br ON br.right_id = r.right_id
+     WHERE r.content_id = ? AND r.user_id = ? AND r.right_type = ?`,
     [contentId, req.user.userId, typeToGrant]
   );
-  if (existing.length > 0 && existing[0].status === 'ACTIVE') {
+  if (existing.length > 0 && existing[0].status === 'ACTIVE' &&
+      (existing[0].expiration_timestamp === null || existing[0].expiration_timestamp === 0 || Number(existing[0].expiration_timestamp) > Math.floor(Date.now() / 1000))) {
     return res.json({ message: `You already hold active ${typeToGrant} license for this file.` });
   }
 
   const [blockchainAssets] = await pool.query('SELECT status FROM blockchain_assets WHERE content_id = ?', [contentId]);
-  if (blockchainAssets.length && blockchainAssets[0].status === 'PENDING') throw new ApiError(409, 'Asset registration is in progress; try acquiring this license again after it completes.');
+  if (blockchainAssets.length && blockchainAssets[0].status !== 'CONFIRMED') throw new ApiError(409, 'Blockchain asset is not confirmed; retry registration before acquiring a license.');
   const isBlockchainEnabled = blockchainAssets.length > 0 && blockchainAssets[0].status === 'CONFIRMED';
   let blockchainGrant = null;
   let blockchainOperationId = null;
@@ -281,15 +311,17 @@ const purchaseRight = asyncHandler(async (req, res) => {
     const [wallets] = await pool.query('SELECT wallet_address FROM users WHERE user_id = ?', [req.user.userId]);
     if (!wallets[0]?.wallet_address) throw new ApiError(409, 'Link and verify your wallet before acquiring this blockchain license.');
     const [operation] = await pool.query(
-      `INSERT INTO blockchain_operations (content_id, operation_type, wallet_address, right_type, status)
-       VALUES (?, 'GRANT', ?, ?, 'PENDING')`,
-      [contentId, wallets[0].wallet_address, typeToGrant]
+      `INSERT INTO blockchain_operations (content_id, actor_user_id, operation_type, wallet_address, right_type, status)
+       VALUES (?, ?, 'GRANT', ?, ?, 'PENDING')`,
+      [contentId, req.user.userId, wallets[0].wallet_address, typeToGrant]
     );
     blockchainOperationId = operation.insertId;
     try {
-      blockchainGrant = await grantLicense(contentId, wallets[0].wallet_address, typeToGrant, 0);
+      blockchainGrant = await grantLicense(contentId, wallets[0].wallet_address, typeToGrant, 0,
+        async ({ hash }) => pool.query("UPDATE blockchain_operations SET transaction_hash = ? WHERE operation_id = ?", [hash, blockchainOperationId]));
     } catch (err) {
-      await pool.query(`UPDATE blockchain_operations SET status = 'FAILED', database_sync_status = 'FAILED', error_message = ? WHERE operation_id = ?`, [String(err.message || 'Grant failed').slice(0, 490), blockchainOperationId]);
+      await pool.query(`UPDATE blockchain_operations SET status = IF(transaction_hash IS NULL, 'FAILED', 'PENDING'), database_sync_status = IF(transaction_hash IS NULL, 'FAILED', 'PENDING'), error_message = ? WHERE operation_id = ?`, [String(err.message || 'Grant failed').slice(0, 490), blockchainOperationId]);
+      await logSecurityEvent({ req, eventType: 'LICENSE_GRANT_FAILED', contentId, outcome: 'ERROR', detail: 'Blockchain acquisition failed or is awaiting confirmation' });
       if (err instanceof ApiError) throw err;
       throw new ApiError(502, `Blockchain license grant failed: ${String(err.message || 'transaction failed').slice(0, 250)}`);
     }
@@ -341,13 +373,13 @@ const purchaseRight = asyncHandler(async (req, res) => {
 const listAllContentModerator = asyncHandler(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT 
-        c.content_id, c.title, c.original_filename, c.stored_filename, c.file_size, c.file_hash, c.upload_timestamp,
+        c.content_id, c.title, c.original_filename, c.stored_filename, c.file_size, c.file_hash, c.encryption_status, c.upload_timestamp,
         u.user_id AS owner_id, u.name AS owner_name, u.email AS owner_email,
         COUNT(DISTINCT CASE WHEN r.status = 'ACTIVE' THEN r.right_id END) AS active_rights_count
      FROM content c
      JOIN users u ON u.user_id = c.owner_id
      LEFT JOIN rights r ON r.content_id = c.content_id
-     GROUP BY c.content_id, c.title, c.original_filename, c.stored_filename, c.file_size, c.file_hash, c.upload_timestamp, u.user_id, u.name, u.email
+     GROUP BY c.content_id, c.title, c.original_filename, c.stored_filename, c.file_size, c.file_hash, c.encryption_status, c.upload_timestamp, u.user_id, u.name, u.email
      ORDER BY c.upload_timestamp DESC`
   );
   res.json(rows);
@@ -355,21 +387,23 @@ const listAllContentModerator = asyncHandler(async (req, res) => {
 
 // GET /api/content/moderator/verify-all -> batch scan all stored files and check SHA-256 integrity
 const verifyAllIntegrity = asyncHandler(async (req, res) => {
-  const [rows] = await pool.query(
-    'SELECT content_id, title, original_filename, file_path, file_hash FROM content ORDER BY content_id'
-  );
+  const [rows] = await pool.query('SELECT * FROM content ORDER BY content_id');
   const results = [];
   let verifiedCount = 0;
   let modifiedCount = 0;
   let missingCount = 0;
 
   for (const item of rows) {
-    const absolutePath = path.resolve(PROJECT_ROOT, item.file_path);
+    const absolutePath = require('../services/contentProtectionService').resolveStoredPath(item.file_path);
     if (!fs.existsSync(absolutePath)) {
       results.push({ content_id: item.content_id, title: item.title, status: 'MISSING' });
       missingCount++;
     } else {
-      const currentHash = await sha256File(absolutePath);
+      let currentHash;
+      if (item.encryption_status === 'ENCRYPTED') {
+        const plain = await readAuthorizedContent(item);
+        currentHash = require('crypto').createHash('sha256').update(plain).digest('hex');
+      } else currentHash = await sha256File(absolutePath);
       const isVerified = currentHash === item.file_hash;
       if (isVerified) verifiedCount++;
       else modifiedCount++;

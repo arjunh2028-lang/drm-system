@@ -10,11 +10,13 @@ const {
   getRightsForUser,
 } = require('../services/rightsService');
 const { grantLicense, revokeLicense, verifyAccess } = require('../services/blockchainService');
+const { validContentId } = require('../services/contentProtectionService');
+const { logSecurityEvent } = require('../services/securityAuditService');
 
 async function requireBlockchainManager(content, req) {
   const [assets] = await pool.query('SELECT status, owner_wallet FROM blockchain_assets WHERE content_id = ?', [content.content_id]);
-  if (!assets.length || assets[0].status === 'FAILED') return;
-  if (assets[0].status === 'PENDING') throw new ApiError(409, 'Asset registration is in progress; try managing licenses again after it completes.');
+  if (!assets.length) return;
+  if (assets[0].status !== 'CONFIRMED') throw new ApiError(409, 'Blockchain asset is not confirmed; resolve or retry registration before managing licenses.');
   const [walletRows] = await pool.query('SELECT user_id, wallet_address FROM users WHERE user_id IN (?, ?)', [req.user.userId, content.owner_id]);
   const actorWallet = walletRows.find((row) => row.user_id === req.user.userId)?.wallet_address;
   const ownerWallet = walletRows.find((row) => row.user_id === content.owner_id)?.wallet_address;
@@ -28,7 +30,7 @@ async function requireBlockchainManager(content, req) {
 
 // GET /api/content/:id/rights
 const listRights = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
+  const contentId = validContentId(req.params.id);
   const content = await getContentById(contentId);
   if (!content) throw new ApiError(404, 'Content not found.');
 
@@ -45,7 +47,7 @@ const listRights = asyncHandler(async (req, res) => {
 
 // POST /api/content/:id/rights   body: { userId, rightType }
 const grantRight = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
+  const contentId = validContentId(req.params.id);
   const { userId, rightType, expiresAt } = req.body;
 
   if (!userId || !rightType) {
@@ -90,15 +92,17 @@ const grantRight = asyncHandler(async (req, res) => {
     const [wallets] = await pool.query('SELECT wallet_address FROM users WHERE user_id = ?', [userId]);
     if (!wallets[0]?.wallet_address) throw new ApiError(409, 'The license recipient must link a verified wallet first.');
     const [operation] = await pool.query(
-      `INSERT INTO blockchain_operations (content_id, operation_type, wallet_address, right_type, expiration_timestamp, status)
-       VALUES (?, 'GRANT', ?, ?, ?, 'PENDING')`,
-      [contentId, wallets[0].wallet_address, rightType, expirationSeconds || null]
+      `INSERT INTO blockchain_operations (content_id, actor_user_id, operation_type, wallet_address, right_type, expiration_timestamp, status)
+       VALUES (?, ?, 'GRANT', ?, ?, ?, 'PENDING')`,
+      [contentId, req.user.userId, wallets[0].wallet_address, rightType, expirationSeconds || null]
     );
     chainOperationId = operation.insertId;
     try {
-      chainResult = await grantLicense(contentId, wallets[0].wallet_address, rightType, expirationSeconds);
+      chainResult = await grantLicense(contentId, wallets[0].wallet_address, rightType, expirationSeconds,
+        async ({ hash }) => pool.query("UPDATE blockchain_operations SET transaction_hash = ? WHERE operation_id = ?", [hash, chainOperationId]));
     } catch (err) {
-      await pool.query(`UPDATE blockchain_operations SET status = 'FAILED', database_sync_status = 'FAILED', error_message = ? WHERE operation_id = ?`, [String(err.message || 'Grant failed').slice(0, 490), chainOperationId]);
+      await pool.query(`UPDATE blockchain_operations SET status = IF(transaction_hash IS NULL, 'FAILED', 'PENDING'), database_sync_status = IF(transaction_hash IS NULL, 'FAILED', 'PENDING'), error_message = ? WHERE operation_id = ?`, [String(err.message || 'Grant failed').slice(0, 490), chainOperationId]);
+      await logSecurityEvent({ req, eventType: 'LICENSE_GRANT_FAILED', contentId, outcome: 'ERROR', detail: 'Blockchain grant failed or is awaiting confirmation' });
       if (err instanceof ApiError) throw err;
       throw new ApiError(502, `Blockchain license grant failed: ${String(err.message || 'transaction failed').slice(0, 250)}`);
     }
@@ -133,8 +137,8 @@ const grantRight = asyncHandler(async (req, res) => {
 
 // DELETE /api/content/:id/rights/:rightId
 const revokeRight = asyncHandler(async (req, res) => {
-  const contentId = Number(req.params.id);
-  const rightId = Number(req.params.rightId);
+  const contentId = validContentId(req.params.id);
+  const rightId = validContentId(req.params.rightId);
 
   const content = await getContentById(contentId);
   if (!content) throw new ApiError(404, 'Content not found.');
@@ -163,15 +167,17 @@ const revokeRight = asyncHandler(async (req, res) => {
     );
     if (!licenseRows[0]?.wallet_address) throw new ApiError(409, 'The license recipient has no verified wallet.');
     const [operation] = await pool.query(
-      `INSERT INTO blockchain_operations (content_id, right_id, operation_type, wallet_address, right_type, status)
-       VALUES (?, ?, 'REVOKE', ?, ?, 'PENDING')`,
-      [contentId, rightId, licenseRows[0].wallet_address, licenseRows[0].right_type]
+      `INSERT INTO blockchain_operations (content_id, right_id, actor_user_id, operation_type, wallet_address, right_type, status)
+       VALUES (?, ?, ?, 'REVOKE', ?, ?, 'PENDING')`,
+      [contentId, rightId, req.user.userId, licenseRows[0].wallet_address, licenseRows[0].right_type]
     );
     chainOperationId = operation.insertId;
     try {
-      chainResult = await revokeLicense(contentId, licenseRows[0].wallet_address, licenseRows[0].right_type);
+      chainResult = await revokeLicense(contentId, licenseRows[0].wallet_address, licenseRows[0].right_type,
+        async ({ hash }) => pool.query("UPDATE blockchain_operations SET transaction_hash = ? WHERE operation_id = ?", [hash, chainOperationId]));
     } catch (err) {
-      await pool.query(`UPDATE blockchain_operations SET status = 'FAILED', database_sync_status = 'FAILED', error_message = ? WHERE operation_id = ?`, [String(err.message || 'Revocation failed').slice(0, 490), chainOperationId]);
+      await pool.query(`UPDATE blockchain_operations SET status = IF(transaction_hash IS NULL, 'FAILED', 'PENDING'), database_sync_status = IF(transaction_hash IS NULL, 'FAILED', 'PENDING'), error_message = ? WHERE operation_id = ?`, [String(err.message || 'Revocation failed').slice(0, 490), chainOperationId]);
+      await logSecurityEvent({ req, eventType: 'LICENSE_REVOKE_FAILED', contentId, outcome: 'ERROR', detail: 'Blockchain revocation failed or is awaiting confirmation' });
       if (err instanceof ApiError) throw err;
       throw new ApiError(502, `Blockchain license revocation failed: ${String(err.message || 'transaction failed').slice(0, 250)}`);
     }

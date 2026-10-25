@@ -1,14 +1,17 @@
 {
   "name": "drm-backend",
   "version": "1.0.0",
-  "description": "DRM System V1 - Express/MySQL backend",
+  "description": "DRM System V2 - Express/MySQL backend with encrypted content protection",
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch-path=src src/server.js",
     "seed": "node scripts/seed.js",
-    "test": "node --test"
+    "test": "node --test",
+    "convert:legacy-content": "node scripts/convert_legacy_content.js",
+    "migrate:v2": "node scripts/migrate_v2.js",
+    "reconcile:blockchain": "node scripts/reconcile_blockchain_operations.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

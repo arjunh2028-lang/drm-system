@@ -214,6 +214,11 @@ export default function ContentDetails() {
 
       {actionMessage && <div className="alert alert-success">{actionMessage}</div>}
       {error && <div className="alert alert-error">{error}</div>}
+      {content.encryptionStatus !== 'ENCRYPTED' && (
+        <div className="alert alert-error">
+          This is a legacy plaintext asset. Protected viewing and downloads are disabled until an administrator runs the verified legacy-content conversion.
+        </div>
+      )}
 
       <div className="panel" style={{ marginBottom: 18 }}>
         <div className="panel-header">
@@ -275,6 +280,10 @@ export default function ContentDetails() {
               <div style={{ color: '#334155', marginTop: '2px' }}>{new Date(content.uploadTimestamp).toLocaleString()}</div>
             </div>
 
+            <div>
+              <div style={{ color: '#64748b', fontSize: '0.78rem', textTransform: 'uppercase', fontWeight: 600 }}>At-rest protection</div>
+              <div style={{ fontWeight: 600, marginTop: '2px' }}>{content.encryptionStatus === 'ENCRYPTED' ? 'AES-256-GCM encrypted' : 'Legacy plaintext — conversion required'}</div>
+            </div>
             <div>
               <div style={{ color: '#64748b', fontSize: '0.78rem', textTransform: 'uppercase', fontWeight: 600 }}>Stored SHA-256 Digest</div>
               <div style={{ marginTop: '4px' }}>

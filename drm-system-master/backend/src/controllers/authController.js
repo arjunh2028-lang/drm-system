@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../config/db');
 const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
+const { logSecurityEvent } = require('../services/securityAuditService');
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -74,12 +75,14 @@ const login = asyncHandler(async (req, res) => {
   );
 
   if (rows.length === 0) {
+    await logSecurityEvent({ req, eventType: 'AUTHENTICATION_FAILED', detail: 'Invalid credentials' });
     throw new ApiError(401, 'Invalid email or password.');
   }
 
   const user = rows[0];
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) {
+    await logSecurityEvent({ req, eventType: 'AUTHENTICATION_FAILED', detail: 'Invalid credentials' });
     throw new ApiError(401, 'Invalid email or password.');
   }
 
