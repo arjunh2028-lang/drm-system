@@ -40,6 +40,11 @@ DROP TRIGGER IF EXISTS trg_rights_after_update;
 DROP TRIGGER IF EXISTS trg_rights_after_insert;
 
 DROP TABLE IF EXISTS activity_log;
+DROP TABLE IF EXISTS security_events;
+DROP TABLE IF EXISTS wallet_link_challenges;
+DROP TABLE IF EXISTS blockchain_operations;
+DROP TABLE IF EXISTS blockchain_rights;
+DROP TABLE IF EXISTS blockchain_assets;
 DROP TABLE IF EXISTS rights;
 DROP TABLE IF EXISTS content;
 DROP TABLE IF EXISTS users;
@@ -83,8 +88,10 @@ CREATE TABLE users (
     email           VARCHAR(150)        NOT NULL,
     password_hash   VARCHAR(255)        NOT NULL,
     role            VARCHAR(20)         NOT NULL DEFAULT 'CONSUMER',
+    wallet_address  CHAR(42)            NULL,
     created_at      DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_users_email UNIQUE (email),
+    CONSTRAINT uq_users_wallet UNIQUE (wallet_address),
     CONSTRAINT fk_users_role
         FOREIGN KEY (role) REFERENCES roles(role_name)
         ON UPDATE CASCADE,
@@ -110,6 +117,14 @@ CREATE TABLE content (
     stored_filename     VARCHAR(255)        NOT NULL,
     file_path           VARCHAR(500)        NOT NULL,
     file_hash           CHAR(64)            NOT NULL,           -- SHA-256 hex digest
+    encryption_status   VARCHAR(20)         NOT NULL DEFAULT 'LEGACY',
+    encrypted_dek       VARCHAR(100)        NULL,
+    kek_nonce           VARCHAR(32)         NULL,
+    kek_auth_tag        VARCHAR(32)         NULL,
+    content_nonce       VARCHAR(32)         NULL,
+    content_auth_tag    VARCHAR(32)         NULL,
+    encrypted_file_hash CHAR(64)            NULL,
+    kek_version         VARCHAR(32)         NOT NULL DEFAULT 'v1',
     file_size           BIGINT UNSIGNED     NOT NULL,
     owner_id            INT                 NOT NULL,
     upload_timestamp    DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -119,10 +134,24 @@ CREATE TABLE content (
         ON DELETE CASCADE
         ON UPDATE CASCADE,
     CONSTRAINT chk_content_file_size CHECK (file_size >= 0),
-    CONSTRAINT chk_content_hash_len CHECK (CHAR_LENGTH(file_hash) = 64)
+    CONSTRAINT chk_content_hash_len CHECK (CHAR_LENGTH(file_hash) = 64),
+    CONSTRAINT chk_content_encryption_status CHECK (encryption_status IN ('LEGACY', 'ENCRYPTED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE INDEX idx_content_owner ON content(owner_id);
+
+CREATE TABLE blockchain_assets (
+    content_id          INT PRIMARY KEY,
+    chain_id            BIGINT UNSIGNED NOT NULL,
+    contract_address    CHAR(42) NOT NULL,
+    owner_wallet        CHAR(42) NOT NULL,
+    status              VARCHAR(20) NOT NULL,
+    registration_tx     CHAR(66) NULL,
+    error_message       VARCHAR(500) NULL,
+    updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_blockchain_asset_content FOREIGN KEY (content_id) REFERENCES content(content_id) ON DELETE CASCADE,
+    CONSTRAINT chk_blockchain_asset_status CHECK (status IN ('PENDING', 'CONFIRMED', 'FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------
 -- 4. RIGHT_TYPES (3NF Master / Lookup Entity)
@@ -202,6 +231,55 @@ CREATE INDEX idx_rights_user ON rights(user_id);
 CREATE INDEX idx_rights_content ON rights(content_id);
 CREATE INDEX idx_rights_status ON rights(status);
 
+CREATE TABLE blockchain_rights (
+    right_id            INT PRIMARY KEY,
+    expiration_timestamp BIGINT UNSIGNED NULL COMMENT 'Unix seconds; NULL means no expiration',
+    transaction_hash    CHAR(66) NULL,
+    status              VARCHAR(20) NOT NULL,
+    error_message       VARCHAR(500) NULL,
+    updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_blockchain_right_right FOREIGN KEY (right_id) REFERENCES rights(right_id) ON DELETE CASCADE,
+    CONSTRAINT chk_blockchain_right_status CHECK (status IN ('PENDING', 'CONFIRMED', 'FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE blockchain_operations (
+    operation_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    content_id INT NOT NULL,
+    right_id INT NULL,
+    actor_user_id INT NULL,
+    operation_type VARCHAR(10) NOT NULL,
+    wallet_address CHAR(42) NOT NULL,
+    right_type VARCHAR(20) NOT NULL,
+    expiration_timestamp BIGINT UNSIGNED NULL COMMENT 'Unix seconds; NULL means no expiration',
+    operation_key CHAR(36) NULL,
+    transaction_hash CHAR(66) NULL,
+    block_number BIGINT UNSIGNED NULL,
+    status VARCHAR(20) NOT NULL,
+    database_sync_status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    error_message VARCHAR(500) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_blockchain_operation_content FOREIGN KEY (content_id) REFERENCES content(content_id) ON DELETE CASCADE,
+    CONSTRAINT fk_blockchain_operation_right FOREIGN KEY (right_id) REFERENCES rights(right_id) ON DELETE SET NULL,
+    CONSTRAINT fk_blockchain_operation_actor FOREIGN KEY (actor_user_id) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT chk_blockchain_operation_type CHECK (operation_type IN ('GRANT', 'REVOKE')),
+    CONSTRAINT chk_blockchain_operation_status CHECK (status IN ('PENDING', 'CONFIRMED', 'FAILED')),
+    CONSTRAINT chk_blockchain_operation_sync CHECK (database_sync_status IN ('PENDING', 'SYNCED', 'FAILED')),
+    CONSTRAINT uq_blockchain_operation_key UNIQUE (operation_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE wallet_link_challenges (
+    challenge_id    BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id         INT NOT NULL,
+    wallet_address  CHAR(42) NOT NULL,
+    nonce           CHAR(64) NOT NULL UNIQUE,
+    message         VARCHAR(500) NOT NULL,
+    expires_at      DATETIME NOT NULL,
+    consumed_at     DATETIME NULL,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_wallet_challenge_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ---------------------------------------------------------------------
 -- 7. ACTIVITY_ACTIONS (3NF Master / Lookup Entity)
 -- FDs: action_code -> category, description
@@ -261,6 +339,22 @@ CREATE INDEX idx_activity_content ON activity_log(content_id);
 CREATE INDEX idx_activity_actor ON activity_log(actor_id);
 CREATE INDEX idx_activity_created ON activity_log(created_at);
 CREATE INDEX idx_activity_action ON activity_log(action);
+
+CREATE TABLE security_events (
+    security_event_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    actor_id INT NULL,
+    content_id INT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    outcome VARCHAR(20) NOT NULL,
+    detail VARCHAR(240) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_security_event_actor FOREIGN KEY (actor_id) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_security_event_content FOREIGN KEY (content_id) REFERENCES content(content_id) ON DELETE SET NULL,
+    CONSTRAINT chk_security_event_outcome CHECK (outcome IN ('ALLOWED', 'DENIED', 'ERROR'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE INDEX idx_security_actor_time ON security_events(actor_id, created_at);
+CREATE INDEX idx_security_content_time ON security_events(content_id, created_at);
+CREATE INDEX idx_security_type_time ON security_events(event_type, created_at);
 
 -- =====================================================================
 -- VIEWS (Preserves Normalized Storage while Simplifying Complex Joins)

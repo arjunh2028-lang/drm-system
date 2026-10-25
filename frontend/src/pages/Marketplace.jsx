@@ -96,7 +96,7 @@ export default function Marketplace() {
           </div>
           <h1>Content Catalog & Licensing</h1>
           <p className="page-subtitle">
-            Discover encrypted assets published by creators. Acquire VIEW or DOWNLOAD licenses to access them securely.
+            Browse assets published by creators and acquire VIEW or DOWNLOAD permissions. Registered assets also check on-chain license state at access time.
           </p>
         </div>
       </div>
@@ -239,7 +239,7 @@ export default function Marketplace() {
                 <div>
                   <div style={{ fontWeight: 600, fontSize: '0.9rem', color: '#0f172a' }}>VIEW License (Read-Only)</div>
                   <div style={{ fontSize: '0.78rem', color: '#64748b' }}>
-                    Permits in-browser decryption and live inspection without file download.
+                    Permits in-browser file viewing without initiating a download.
                   </div>
                 </div>
               </label>
@@ -267,7 +267,7 @@ export default function Marketplace() {
                 <div>
                   <div style={{ fontWeight: 600, fontSize: '0.9rem', color: '#0f172a' }}>DOWNLOAD License (Full Access)</div>
                   <div style={{ fontSize: '0.78rem', color: '#64748b' }}>
-                    Allows secure file download and offline storage of the original decrypted file.
+                    Allows download of the original file. A downloaded copy cannot be revoked remotely.
                   </div>
                 </div>
               </label>

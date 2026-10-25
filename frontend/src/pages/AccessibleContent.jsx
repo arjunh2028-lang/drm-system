@@ -62,7 +62,7 @@ export default function AccessibleContent() {
             <KeyRound size={16} /> Digital License Library
           </div>
           <h1>My Licensed Content</h1>
-          <p className="page-subtitle">DRM-protected assets licensed to you by content owners or purchased in the marketplace.</p>
+          <p className="page-subtitle">Files with active database licenses; blockchain-enabled files also require a valid on-chain license to open.</p>
         </div>
 
         <Link to="/marketplace" className="btn btn-buyer">

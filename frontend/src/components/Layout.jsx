@@ -17,6 +17,7 @@ import {
 
 import ThemeToggle from './ThemeToggle';
 import AntigravityCanvas from './AntigravityCanvas';
+import WalletLink from './WalletLink';
 
 export default function Layout({ children }) {
   const { user, logout } = useAuth();
@@ -191,6 +192,7 @@ export default function Layout({ children }) {
               <span className={`sidebar-user-role ${roleInfo.class}`}>
                 {roleInfo.label}
               </span>
+              <WalletLink />
             </div>
           </div>
 

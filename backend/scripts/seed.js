@@ -6,25 +6,24 @@
  * database/sample_data.sql directly), because it:
  *   - hashes the demo password with the SAME bcrypt library the app
  *     uses at runtime, so login is guaranteed to work;
- *   - writes the sample files to disk itself and hashes them with the
- *     SAME SHA-256 routine the app uses, so integrity verification is
- *     guaranteed to show VERIFIED regardless of OS/line-ending quirks.
+ *   - encrypts the sample bytes in memory before writing ciphertext only.
  *
- * Usage (from the backend/ directory, after `npm install` and with a
+ * Usage (from the backend/ directory, after dependency installation and with a
  * .env file pointing at a running MySQL server that already has
  * database/schema.sql applied):
  *
- *   npm run seed
+ *   DEMO_PASSWORD=<private-value> pnpm run seed
  */
 require('dotenv').config();
 const fs = require('fs');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { pool } = require('../src/config/db');
-const { sha256File } = require('../src/services/hashService');
+const { encryptBuffer } = require('../src/services/encryptionService');
 const { UPLOAD_DIR, PROJECT_ROOT } = require('../src/config/paths');
 const path = require('path');
 
-const DEMO_PASSWORD = 'Password123!';
+const DEMO_PASSWORD = process.env.DEMO_PASSWORD;
 
 const DEMO_USERS = [
   { name: 'Alice Sharma', email: 'alice@example.com', role: 'CREATOR' },
@@ -35,7 +34,7 @@ const DEMO_USERS = [
 const DEMO_FILES = [
   {
     title: 'Project Proposal',
-    filename: 'project_proposal.pdf',
+    filename: 'project_proposal.txt',
     ownerIndex: 0,
     body: `Project Proposal
 =================
@@ -49,7 +48,7 @@ portal integrating attendance, grades, and library services.
   },
   {
     title: 'Research Notes',
-    filename: 'research_notes.docx',
+    filename: 'research_notes.txt',
     ownerIndex: 0,
     body: `Research Notes
 ===============
@@ -62,19 +61,13 @@ Summary of Raft vs Paxos trade-offs for the semester research paper.
   },
   {
     title: 'Financial Report Q1',
-    filename: 'financial_report.xlsx',
+    filename: 'financial_report.csv',
     ownerIndex: 1,
-    body: `Financial Report Q1
-====================
-Prepared by: Bob Mehta
-
-Revenue, Expenses, Net Income summary for Q1.
-(Sample placeholder content for DRM demo purposes.)
-`,
+    body: 'Quarter,Revenue,Expenses,Net Income\nQ1,125000,83000,42000\n',
   },
   {
     title: 'Marketing Plan',
-    filename: 'marketing_plan.pdf',
+    filename: 'marketing_plan.txt',
     ownerIndex: 2,
     body: `Marketing Plan
 ==============
@@ -86,7 +79,7 @@ Go-to-market strategy for the Spring product launch.
   },
   {
     title: 'Source Code Bundle',
-    filename: 'source_code.zip',
+    filename: 'source_code.txt',
     ownerIndex: 1,
     body: `Source Code Bundle (placeholder, not a real zip)
 =================================================
@@ -99,44 +92,65 @@ This file stands in for a zipped source-code archive for demo purposes.
 
 async function main() {
   console.log('[seed] Starting...');
+  if (typeof DEMO_PASSWORD !== 'string' || DEMO_PASSWORD.length < 12) {
+    throw new Error('Set DEMO_PASSWORD to a private value of at least 12 characters before creating demo users.');
+  }
+  require('../src/services/encryptionService').validateConfiguration();
   if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-  await pool.query('SET FOREIGN_KEY_CHECKS = 0');
-  await pool.query('TRUNCATE TABLE activity_log');
-  await pool.query('TRUNCATE TABLE rights');
-  await pool.query('TRUNCATE TABLE content');
-  await pool.query('TRUNCATE TABLE users');
-  await pool.query('SET FOREIGN_KEY_CHECKS = 1');
 
   // --- Users ---
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 10);
   const userIds = [];
   for (const u of DEMO_USERS) {
-    const [result] = await pool.query(
-      'INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)',
-      [u.name, u.email, passwordHash, u.role]
-    );
-    userIds.push(result.insertId);
-    console.log(`[seed] Created user: ${u.name} <${u.email}>`);
+    const [existing] = await pool.query('SELECT user_id FROM users WHERE email = ?', [u.email]);
+    if (existing.length) {
+      userIds.push(existing[0].user_id);
+      console.log(`[seed] Reusing existing user: ${u.email}`);
+    } else {
+      const [result] = await pool.query(
+        'INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)',
+        [u.name, u.email, passwordHash, u.role]
+      );
+      userIds.push(result.insertId);
+      console.log(`[seed] Created user: ${u.name} <${u.email}>`);
+    }
   }
 
   // --- Content ---
   const contentIds = [];
   for (const f of DEMO_FILES) {
-    const uniqueName = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}-${f.filename}`;
-    const absPath = path.join(UPLOAD_DIR, uniqueName);
-    fs.writeFileSync(absPath, f.body, 'utf8');
-
-    const hash = await sha256File(absPath);
-    const size = fs.statSync(absPath).size;
     const ownerId = userIds[f.ownerIndex];
-    const relativePath = path.relative(PROJECT_ROOT, absPath);
-
-    const [result] = await pool.query(
-      `INSERT INTO content (title, original_filename, stored_filename, file_path, file_hash, file_size, owner_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [f.title, f.filename, uniqueName, relativePath, hash, size, ownerId]
+    const [existing] = await pool.query(
+      'SELECT content_id, encryption_status FROM content WHERE owner_id = ? AND title = ? AND original_filename = ? ORDER BY content_id LIMIT 1',
+      [ownerId, f.title, f.filename]
     );
+    if (existing.length) {
+      contentIds.push(existing[0].content_id);
+      console.log(`[seed] Reusing existing content: ${f.title} (${existing[0].encryption_status || 'LEGACY'})`);
+      continue;
+    }
+    const plaintext = Buffer.from(f.body, 'utf8');
+    const encrypted = encryptBuffer(plaintext);
+    const uniqueName = `${crypto.randomBytes(16).toString('hex')}.drm`;
+    const absPath = path.join(UPLOAD_DIR, uniqueName);
+    fs.writeFileSync(absPath, encrypted.ciphertext, { flag: 'wx', mode: 0o600 });
+    const hash = crypto.createHash('sha256').update(plaintext).digest('hex');
+    const size = plaintext.length;
+    const relativePath = path.relative(PROJECT_ROOT, absPath);
+    let result;
+    try {
+      [result] = await pool.query(
+        `INSERT INTO content (title, original_filename, stored_filename, file_path, file_hash, file_size, owner_id,
+          encryption_status, encrypted_dek, kek_nonce, kek_auth_tag, content_nonce, content_auth_tag, encrypted_file_hash, kek_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'ENCRYPTED', ?, ?, ?, ?, ?, ?, ?)`,
+        [f.title, f.filename, uniqueName, relativePath, hash, size, ownerId, encrypted.metadata.encryptedDek,
+          encrypted.metadata.wrapIv, encrypted.metadata.wrapTag, encrypted.metadata.contentIv, encrypted.metadata.contentTag,
+          encrypted.metadata.encryptedHash, encrypted.metadata.keyVersion]
+      );
+    } catch (error) {
+      fs.unlinkSync(absPath);
+      throw error;
+    }
     contentIds.push(result.insertId);
 
     await pool.query(
@@ -174,13 +188,13 @@ async function main() {
     console.log('[seed] Revoked one sample right to demonstrate the workflow.');
   }
 
-  console.log('\n[seed] Done! Test accounts (all use the same password):');
-  DEMO_USERS.forEach((u) => console.log(`   - ${u.email} / ${DEMO_PASSWORD}`));
+  console.log('\n[seed] Done. Demo account email addresses:');
+  DEMO_USERS.forEach((u) => console.log(`   - ${u.email}`));
+  console.log('[seed] The configured demo password was not printed.');
 
-  await pool.end();
 }
 
 main().catch((err) => {
   console.error('[seed] Failed:', err);
   process.exit(1);
-});
+}).finally(async () => pool.end());

@@ -97,7 +97,7 @@ export default function Dashboard() {
           </div>
           <h1>Welcome, {user?.name?.split(' ')[0]}</h1>
           <p className="page-subtitle">
-            {role === 'CREATOR' && 'Manage your encrypted assets, access permissions, and distribution.'}
+            {role === 'CREATOR' && 'Manage uploaded assets, access permissions, and distribution records.'}
             {role === 'CONSUMER' && 'Browse licensed assets, view files, and discover new protected content.'}
             {role === 'MODERATOR' && 'System-wide governance, global asset registry, and integrity monitoring.'}
           </p>
@@ -239,7 +239,7 @@ export default function Dashboard() {
               <div className="action-card-title">
                 Upload New Asset <ArrowRight size={14} />
               </div>
-              <div className="action-card-desc">Encrypt and register new files on the ledger.</div>
+              <div className="action-card-desc">Upload and hash a file, then optionally register its hash and owner on-chain.</div>
             </Link>
           )}
 

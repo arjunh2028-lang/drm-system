@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../config/db');
 const ApiError = require('../utils/ApiError');
 const asyncHandler = require('../utils/asyncHandler');
+const { logSecurityEvent } = require('../services/securityAuditService');
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -35,6 +36,9 @@ const register = asyncHandler(async (req, res) => {
 
   const validRoles = ['CREATOR', 'CONSUMER', 'MODERATOR'];
   const assignedRole = role && validRoles.includes(role.toUpperCase()) ? role.toUpperCase() : 'CONSUMER';
+  if (assignedRole === 'MODERATOR') {
+    throw new ApiError(403, 'Moderator accounts must be provisioned by an administrator.');
+  }
 
   const [existing] = await pool.query('SELECT user_id FROM users WHERE email = ?', [email.toLowerCase()]);
   if (existing.length > 0) {
@@ -62,6 +66,7 @@ const login = asyncHandler(async (req, res) => {
   const { email, password, expectedRole } = req.body;
 
   if (!email || !password) {
+    await logSecurityEvent({ req, eventType: 'AUTHENTICATION_FAILED', detail: 'Required login fields missing' });
     throw new ApiError(400, 'Email and password are required.');
   }
 
@@ -71,16 +76,19 @@ const login = asyncHandler(async (req, res) => {
   );
 
   if (rows.length === 0) {
+    await logSecurityEvent({ req, eventType: 'AUTHENTICATION_FAILED', detail: 'Invalid credentials' });
     throw new ApiError(401, 'Invalid email or password.');
   }
 
   const user = rows[0];
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) {
+    await logSecurityEvent({ req, eventType: 'AUTHENTICATION_FAILED', detail: 'Invalid credentials' });
     throw new ApiError(401, 'Invalid email or password.');
   }
 
   if (expectedRole && user.role !== expectedRole.toUpperCase()) {
+    await logSecurityEvent({ req, eventType: 'AUTHENTICATION_ROLE_MISMATCH', outcome: 'DENIED', detail: 'Login portal role did not match account role' });
     throw new ApiError(403, `This account is registered as ${user.role}. Please use the ${user.role} login portal.`);
   }
 
@@ -95,14 +103,14 @@ const login = asyncHandler(async (req, res) => {
 
 const me = asyncHandler(async (req, res) => {
   const [rows] = await pool.query(
-    'SELECT user_id, name, email, role, created_at FROM users WHERE user_id = ?',
+    'SELECT user_id, name, email, role, wallet_address, created_at FROM users WHERE user_id = ?',
     [req.user.userId]
   );
   if (rows.length === 0) {
     throw new ApiError(404, 'User not found.');
   }
   const u = rows[0];
-  res.json({ id: u.user_id, name: u.name, email: u.email, role: u.role, createdAt: u.created_at });
+  res.json({ id: u.user_id, name: u.name, email: u.email, role: u.role, walletAddress: u.wallet_address, createdAt: u.created_at });
 });
 
 // Used by the frontend to populate the "grant right to user" dropdown.

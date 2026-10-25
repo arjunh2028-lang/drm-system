@@ -16,7 +16,7 @@ export function AuthProvider({ children }) {
       // Re-validate the token against the server in the background.
       getMe()
         .then((res) => {
-          const refreshed = { id: res.data.id, name: res.data.name, email: res.data.email, role: res.data.role };
+          const refreshed = { id: res.data.id, name: res.data.name, email: res.data.email, role: res.data.role, walletAddress: res.data.walletAddress || null };
           setUser(refreshed);
           localStorage.setItem('drm_user', JSON.stringify(refreshed));
         })

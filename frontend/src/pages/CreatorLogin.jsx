@@ -42,7 +42,7 @@ export default function CreatorLogin() {
       {transitioning && (
         <Loader
           fullScreen={true}
-          message="Entering Creator Studio & decrypting rights vault..."
+          message="Loading creator workspace and current license records..."
         />
       )}
       <ThemeToggle variant="floating" />

@@ -40,11 +40,11 @@ export default function LoginPortalHub() {
             </div>
             <h2 className="portal-role-name">Content Creator</h2>
             <p className="portal-desc">
-              For content owners, authors, researchers, and creators looking to protect, encrypt, and monetize digital assets.
+              For content owners, authors, researchers, and creators managing files, permissions, and blockchain records.
             </p>
             <ul className="portal-features">
               <li>
-                <Lock size={15} /> Encrypt & upload digital files
+                <Lock size={15} /> Upload files and manage licenses
               </li>
               <li>
                 <FileCheck2 size={15} /> Automated SHA-256 integrity seal
@@ -79,7 +79,7 @@ export default function LoginPortalHub() {
             </div>
             <h2 className="portal-role-name">Buyer / User</h2>
             <p className="portal-desc">
-              For end-users, clients, and consumers seeking to discover, purchase, and consume DRM-protected licensed files.
+              For end-users, clients, and consumers seeking to discover and access licensed files.
             </p>
             <ul className="portal-features">
               <li>
@@ -89,7 +89,7 @@ export default function LoginPortalHub() {
                 <Eye size={15} /> Acquire VIEW & DOWNLOAD rights
               </li>
               <li>
-                <Lock size={15} /> Instant secure in-browser decryption
+                <Lock size={15} /> Access checks for registered licenses
               </li>
             </ul>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>

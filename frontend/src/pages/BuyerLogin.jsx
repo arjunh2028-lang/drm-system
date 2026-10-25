@@ -64,7 +64,7 @@ export default function BuyerLogin() {
 
         <h1 style={{ fontSize: '1.65rem' }}>Buyer Sign In</h1>
         <p className="page-subtitle" style={{ marginBottom: '22px' }}>
-          Explore the DRM content catalog, access purchased digital licenses, and securely stream or download files.
+          Explore the content catalog, review your licenses, and access files allowed by their current permissions.
         </p>
 
         {error && <div className="alert alert-error">{error}</div>}

@@ -42,7 +42,7 @@ export default function ModeratorLogin() {
       {transitioning && (
         <Loader
           fullScreen={true}
-          message="Authenticating Moderator clearance & decrypting audit logs..."
+          message="Authenticating moderator access and loading audit records..."
         />
       )}
       <ThemeToggle variant="floating" />

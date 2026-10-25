@@ -67,7 +67,7 @@ export default function MyContent() {
             <FolderLock size={16} /> Content Portfolio
           </div>
           <h1>My Content</h1>
-          <p className="page-subtitle">Encrypted files you own, manage digital licenses for, and monitor.</p>
+          <p className="page-subtitle">Files you own, manage digital licenses for, and monitor.</p>
         </div>
         <Link to="/upload" className="btn btn-creator">
           <UploadCloud size={16} /> Upload New File
@@ -92,7 +92,7 @@ export default function MyContent() {
 
         {loading ? (
           <div style={{ padding: '60px 0', display: 'flex', justifyContent: 'center' }}>
-            <Loader message="Loading encrypted content files & rights logs..." />
+            <Loader message="Loading your files and rights records..." />
           </div>
         ) : filtered.length === 0 ? (
           <div className="empty-state">

@@ -9,7 +9,13 @@ function notFound(req, res, next) {
 // the client -- logs the full detail server-side instead.
 // eslint-disable-next-line no-unused-vars
 function errorHandler(err, req, res, next) {
-  console.error('[error]', err);
+  console.error('[error]', {
+    statusCode: err?.statusCode || 500,
+    code: err?.code || 'UNHANDLED',
+    errorType: String(err?.name || 'Error').replace(/[\r\n\x00-\x1f]/g, ' ').slice(0, 80),
+    route: String(req?.path || '').slice(0, 120),
+    method: String(req?.method || '').slice(0, 12),
+  });
 
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {

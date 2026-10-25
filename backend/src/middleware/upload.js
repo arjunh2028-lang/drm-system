@@ -1,12 +1,5 @@
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
-const { UPLOAD_DIR } = require('../config/paths');
-
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
 
 // Only allow a conservative set of extensions for a college prototype.
 // This is a basic content-type/extension allowlist, not a full
@@ -23,16 +16,6 @@ function sanitizeBaseName(originalName) {
   return base.replace(/[^a-zA-Z0-9-_ ]/g, '').trim().slice(0, 60) || 'file';
 }
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const unique = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
-    const safeBase = sanitizeBaseName(file.originalname);
-    cb(null, `${unique}-${safeBase}${ext}`);
-  },
-});
-
 function fileFilter(req, file, cb) {
   const ext = path.extname(file.originalname).toLowerCase();
   if (!ALLOWED_EXTENSIONS.has(ext)) {
@@ -44,7 +27,9 @@ function fileFilter(req, file, cb) {
 const maxSizeBytes = (Number(process.env.MAX_FILE_SIZE_MB) || 25) * 1024 * 1024;
 
 const upload = multer({
-  storage,
+  // Keep the upload transient in memory. The controller writes only the
+  // authenticated ciphertext to the private storage directory.
+  storage: multer.memoryStorage(),
   fileFilter,
   limits: { fileSize: maxSizeBytes },
 });

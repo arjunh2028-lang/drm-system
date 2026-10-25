@@ -64,7 +64,7 @@ export default function Register() {
       color: '#4f46e5',
       bg: '#eef2ff',
       icon: Palette,
-      desc: 'Upload, encrypt, license and manage digital rights for your files.',
+      desc: 'Upload, register, license and manage digital rights for your files.',
       loginPath: '/login/creator',
     },
     CONSUMER: {
